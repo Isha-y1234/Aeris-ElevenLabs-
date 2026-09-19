@@ -14,6 +14,9 @@ object SettingsRepository {
     private const val KEY_WALKTHROUGH_COMPLETED = "walkthrough_completed"
     private const val KEY_COMM_WALKTHROUGH_COMPLETED = "comm_walkthrough_completed"
     
+    // ElevenLabs Keys
+    private const val KEY_USE_ELEVENLABS = "use_elevenlabs"
+
     // Profile Keys
     private const val KEY_USER_NAME = "user_name"
     private const val KEY_USER_PHONE = "user_phone"
@@ -39,6 +42,10 @@ object SettingsRepository {
     private val _commWalkthroughCompleted = MutableStateFlow(false)
     val commWalkthroughCompleted: StateFlow<Boolean> = _commWalkthroughCompleted
 
+    // ElevenLabs Flows - Set default to true so it works out of the box if API key is set
+    private val _useElevenLabs = MutableStateFlow(true)
+    val useElevenLabs: StateFlow<Boolean> = _useElevenLabs
+
     // Profile Flows
     private val _userName = MutableStateFlow("")
     val userName: StateFlow<String> = _userName
@@ -56,6 +63,9 @@ object SettingsRepository {
         _flashEnabled.value = prefs.getBoolean(KEY_FLASH_ENABLED, true)
         _walkthroughCompleted.value = prefs.getBoolean(KEY_WALKTHROUGH_COMPLETED, false)
         _commWalkthroughCompleted.value = prefs.getBoolean(KEY_COMM_WALKTHROUGH_COMPLETED, false)
+        
+        // Changed default to true
+        _useElevenLabs.value = prefs.getBoolean(KEY_USE_ELEVENLABS, true)
         
         _userName.value = prefs.getString(KEY_USER_NAME, "") ?: ""
         _userPhone.value = prefs.getString(KEY_USER_PHONE, "") ?: ""
@@ -97,6 +107,11 @@ object SettingsRepository {
     fun setCommWalkthroughCompleted(completed: Boolean) {
         prefs.edit().putBoolean(KEY_COMM_WALKTHROUGH_COMPLETED, completed).apply()
         _commWalkthroughCompleted.value = completed
+    }
+
+    fun setUseElevenLabs(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_USE_ELEVENLABS, enabled).apply()
+        _useElevenLabs.value = enabled
     }
 
     fun setUserName(name: String) {

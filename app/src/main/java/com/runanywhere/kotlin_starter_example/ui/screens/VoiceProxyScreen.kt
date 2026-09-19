@@ -1,8 +1,6 @@
 package com.runanywhere.kotlin_starter_example.ui.screens
 
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
+import android.widget.Toast
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -13,22 +11,24 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.*
+import com.runanywhere.kotlin_starter_example.services.ElevenLabsService
 import com.runanywhere.kotlin_starter_example.services.ModelService
+import com.runanywhere.kotlin_starter_example.services.playWavBytes
 import com.runanywhere.sdk.public.RunAnywhere
 import com.runanywhere.sdk.public.extensions.TTS.TTSOptions
 import com.runanywhere.sdk.public.extensions.synthesize
 import kotlinx.coroutines.*
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import com.runanywhere.kotlin_starter_example.services.playWavBytes
 
 @Composable
 fun VoiceProxyScreen(
     modelService: ModelService,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var inputText by remember { mutableStateOf("") }
     var isSpeaking by remember { mutableStateOf(false) }
@@ -50,17 +50,43 @@ fun VoiceProxyScreen(
         if (text.isBlank()) return
         isSpeaking = true
         errorMessage = null
+        
         try {
-            val output = withContext(Dispatchers.IO) {
-                RunAnywhere.synthesize(text, TTSOptions())
+            var audioPlayed = false
+            
+            // 1. Primary: ElevenLabs TTS
+            if (ElevenLabsService.isEnabled(context)) {
+                val audioBytes = ElevenLabsService.textToSpeech(text)
+                if (audioBytes != null) {
+                    ElevenLabsService.playMp3Bytes(context, audioBytes)
+                    audioPlayed = true
+                }
             }
-            withContext(Dispatchers.IO) {
-                playWavBytes(output.audioData)
+            
+            // 2. Fallback: Piper Offline
+            if (!audioPlayed && modelService.isTTSLoaded) {
+                if (ElevenLabsService.isEnabled(context)) {
+                    withContext(Dispatchers.Main) { 
+                        Toast.makeText(context, "ElevenLabs TTS failed, using Piper", Toast.LENGTH_SHORT).show() 
+                    }
+                }
+                val output = withContext(Dispatchers.IO) {
+                    RunAnywhere.synthesize(text, TTSOptions())
+                }
+                withContext(Dispatchers.IO) {
+                    playWavBytes(output.audioData)
+                }
+                audioPlayed = true
             }
-            // Add to recent if not already there
-            if (!recentPhrases.contains(text)) {
-                recentPhrases.add(0, text)
-                if (recentPhrases.size > 6) recentPhrases.removeLastOrNull()
+            
+            if (!audioPlayed) {
+                errorMessage = "No voice models available"
+            } else {
+                // Add to recent if not already there
+                if (!recentPhrases.contains(text)) {
+                    recentPhrases.add(0, text)
+                    if (recentPhrases.size > 6) recentPhrases.removeLastOrNull()
+                }
             }
         } catch (e: Exception) {
             errorMessage = "TTS failed: ${e.message}"
@@ -88,91 +114,45 @@ fun VoiceProxyScreen(
                 }
                 Spacer(Modifier.width(8.dp))
                 Column {
-                    Text(
-                        "Voice Proxy",
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                    Text(
-                        "Type — your phone speaks for you",
-                        fontSize = 13.sp,
-                        color = Color.White.copy(alpha = 0.8f)
-                    )
+                    Text("Voice Proxy", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Type — ElevenLabs premium voice speaks for you", fontSize = 13.sp, color = Color.White.copy(alpha = 0.8f))
                 }
             }
         }
 
         Spacer(Modifier.height(20.dp))
 
-        // Model not loaded
-        if (!modelService.isTTSLoaded) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFFFFD166).copy(alpha = 0.15f)
-                )
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        Icons.Default.CloudDownload,
-                        contentDescription = null,
-                        tint = Color(0xFFFFD166)
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            "TTS model required",
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color(0xFF1A2340)
-                        )
-                        Text(
-                            "Download Piper TTS from Home screen",
-                            fontSize = 12.sp,
-                            color = Color(0xFF6B7A9A)
-                        )
-                    }
-                }
-            }
-            Spacer(Modifier.height(16.dp))
+        // Status Card
+        if (ElevenLabsService.isEnabled(context)) {
+            StatusCard(label = "ElevenLabs TTS Active", color = Color(0xFF6BCB77), icon = Icons.Default.CloudDone)
+        } else {
+            StatusCard(label = "Piper Offline TTS Active", color = Color(0xFFFFD166), icon = Icons.Default.CloudOff)
         }
+
+        Spacer(Modifier.height(16.dp))
 
         // Text input card
         Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
             shape = RoundedCornerShape(16.dp),
             colors = CardDefaults.cardColors(containerColor = Color.White),
             elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    "What do you want to say?",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = Color(0xFF6B7A9A)
-                )
+                Text("What do you want to say?", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = Color(0xFF6B7A9A))
                 Spacer(Modifier.height(10.dp))
                 OutlinedTextField(
                     value = inputText,
                     onValueChange = { inputText = it },
                     modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("Type your message here…") },
+                    placeholder = { Text("Type your message here…", color = Color(0xFFB0B0B0)) },
                     minLines = 4,
                     maxLines = 6,
                     shape = RoundedCornerShape(12.dp),
+                    textStyle = TextStyle(color = Color.Black, fontSize = 16.sp),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.Black,     // 🔥 FIX
-                        unfocusedTextColor = Color.Black,   // 🔥 FIX
-
+                        focusedTextColor = Color.Black,
+                        unfocusedTextColor = Color.Black,
                         focusedBorderColor = softBlue,
                         unfocusedBorderColor = Color(0xFFEEF0F5)
                     )
@@ -180,31 +160,19 @@ fun VoiceProxyScreen(
                 Spacer(Modifier.height(12.dp))
                 Button(
                     onClick = { scope.launch { speak(inputText) } },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp),
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
                     shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = softBlue
-                    ),
-                    enabled = modelService.isTTSLoaded && !isSpeaking && inputText.isNotBlank()
+                    colors = ButtonDefaults.buttonColors(containerColor = softBlue),
+                    enabled = !isSpeaking && inputText.isNotBlank()
                 ) {
                     if (isSpeaking) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp
-                        )
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
                         Spacer(Modifier.width(8.dp))
                         Text("Speaking…", fontWeight = FontWeight.SemiBold)
                     } else {
                         Icon(Icons.Default.VolumeUp, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
-                        Text(
-                            "Speak Aloud",
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                        Text("Speak Aloud", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -213,52 +181,23 @@ fun VoiceProxyScreen(
         Spacer(Modifier.height(20.dp))
 
         // Quick phrases
-        Text(
-            "Quick Phrases",
-            fontSize = 14.sp,
-            fontWeight = FontWeight.Medium,
-            color = Color(0xFF6B7A9A),
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
-        )
+        Text("Quick Phrases", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = Color(0xFF6B7A9A), modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp))
         Spacer(Modifier.height(8.dp))
 
         recentPhrases.forEach { phrase ->
             Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 4.dp)
-                    .clickable {
-                        if (modelService.isTTSLoaded && !isSpeaking) {
-                            scope.launch { speak(phrase) }
-                        }
-                    },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp).clickable {
+                    if (!isSpeaking) { scope.launch { speak(phrase) } }
+                },
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
                 elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
             ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        Icons.Default.VolumeUp,
-                        contentDescription = null,
-                        tint = softBlue,
-                        modifier = Modifier.size(20.dp)
-                    )
+                Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.VolumeUp, null, tint = softBlue, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(12.dp))
-                    Text(
-                        phrase,
-                        fontSize = 14.sp,
-                        color = Color(0xFF1A2340),
-                        modifier = Modifier.weight(1f)
-                    )
-                    Icon(
-                        Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        tint = Color(0xFFB0B0B0),
-                        modifier = Modifier.size(18.dp)
-                    )
+                    Text(phrase, fontSize = 14.sp, color = Color(0xFF1A2340), modifier = Modifier.weight(1f))
+                    Icon(Icons.Default.PlayArrow, null, tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))
                 }
             }
         }
@@ -266,20 +205,11 @@ fun VoiceProxyScreen(
         errorMessage?.let {
             Spacer(Modifier.height(16.dp))
             Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFFFF6B6B).copy(alpha = 0.1f)
-                ),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFF6B6B).copy(alpha = 0.1f)),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Text(
-                    it,
-                    modifier = Modifier.padding(16.dp),
-                    fontSize = 13.sp,
-                    color = Color(0xFFFF6B6B)
-                )
+                Text(it, modifier = Modifier.padding(16.dp), fontSize = 13.sp, color = Color(0xFFFF6B6B))
             }
         }
 
@@ -287,3 +217,17 @@ fun VoiceProxyScreen(
     }
 }
 
+@Composable
+private fun StatusCard(label: String, color: Color, icon: androidx.compose.ui.graphics.vector.ImageVector) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = color.copy(alpha = 0.1f))
+    ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, null, tint = color, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(10.dp))
+            Text(label, fontSize = 12.sp, color = color, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}

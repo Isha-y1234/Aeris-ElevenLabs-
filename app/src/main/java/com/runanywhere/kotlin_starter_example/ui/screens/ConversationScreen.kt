@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.*
@@ -28,14 +30,16 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
 import androidx.core.content.ContextCompat
+import com.runanywhere.kotlin_starter_example.BuildConfig
 import com.runanywhere.kotlin_starter_example.data.HistoryContentLine
 import com.runanywhere.kotlin_starter_example.data.HistoryType
-import com.runanywhere.kotlin_starter_example.data.SyncedHistoryItem
+import com.runanywhere.kotlin_starter_example.services.AudioForegroundService
+import com.runanywhere.kotlin_starter_example.services.ElevenLabsService
 import com.runanywhere.kotlin_starter_example.services.ModelService
 import com.runanywhere.kotlin_starter_example.services.playWavBytes
 import com.runanywhere.kotlin_starter_example.viewmodel.HistoryViewModel
@@ -48,7 +52,6 @@ import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
-import androidx.compose.foundation.layout.navigationBarsPadding
 
 // ── Data models ──────────────────────────────────────────────────────────────
 
@@ -65,8 +68,6 @@ enum class ConversationState {
     GENERATING_SUGGESTIONS,
     SPEAKING
 }
-
-// ── Screen ───────────────────────────────────────────────────────────────────
 
 @Composable
 fun ConversationScreen(
@@ -86,13 +87,20 @@ fun ConversationScreen(
     var hasPermission by remember { mutableStateOf(false) }
     var suggestions by remember { mutableStateOf(listOf<String>()) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    
+    var currentSessionId by remember { mutableStateOf(UUID.randomUUID().toString()) }
+    var streamingTranscript by remember { mutableStateOf("") }
 
     val softBlue = Color(0xFF6FB1FC)
     val purple   = Color(0xFF9C6FFC)
-    val green    = Color(0xFF6BCB77)
     val red      = Color(0xFFFF6B6B)
 
-    // ── Permission ────────────────────────────────────────────
+    fun autoSaveHistory() {
+        if (messages.isEmpty()) return
+        val content = messages.map { HistoryContentLine(it.text, it.isFromOther, it.timestamp) }
+        historyViewModel.saveSession(HistoryType.CONVERSATION, content, currentSessionId)
+    }
+
     LaunchedEffect(Unit) {
         hasPermission = ContextCompat.checkSelfPermission(
             context, Manifest.permission.RECORD_AUDIO
@@ -104,199 +112,199 @@ fun ConversationScreen(
         ActivityResultContracts.RequestPermission()
     ) { hasPermission = it }
 
-    // ── Auto scroll ───────────────────────────────────────────
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1)
+    LaunchedEffect(messages.size, streamingTranscript) {
+        if (messages.isNotEmpty() || streamingTranscript.isNotEmpty()) {
+            val targetIndex = if (streamingTranscript.isNotEmpty()) messages.size else messages.size - 1
+            if (targetIndex >= 0) {
+                listState.animateScrollToItem(targetIndex)
+            }
         }
     }
 
-    // ── Model readiness ───────────────────────────────────────
+    val llmReady = modelService.isLLMLoaded
     val sttReady = modelService.isSTTLoaded
     val ttsReady = modelService.isTTSLoaded
-    val llmReady = modelService.isLLMLoaded
+    val elevenLabsEnabled = ElevenLabsService.isEnabled(context)
 
-    // ── Generate suggestions via LLM ─────────────────────────
-    fun generateSuggestions(lastTranscript: String) {
-        if (!llmReady) return
-
+    fun generateSuggestions() {
         scope.launch {
             conversationState = ConversationState.GENERATING_SUGGESTIONS
+            var cloudReplies: List<String>? = null
+            
+            if (ElevenLabsService.isEnabled(context)) {
+                val historyPairs = messages.map { it.text to it.isFromOther }
+                cloudReplies = ElevenLabsService.generateCloudSuggestions(historyPairs)
+            }
 
-            try {
-                // ✅ Build context from last 4 messages for token efficiency
-                val context = buildString {
-                    appendLine("You are helping a deaf person reply in a conversation.")
-                    appendLine("Recent conversation:")
-                    messages.takeLast(4).forEach { msg ->
-                        appendLine(
-                            if (msg.isFromOther) "Other person: ${msg.text}"
-                            else "Me: ${msg.text}"
-                        )
+            if (cloudReplies != null && cloudReplies.isNotEmpty()) {
+                suggestions = cloudReplies
+                conversationState = ConversationState.IDLE
+            } else {
+                if (llmReady) {
+                    try {
+                        val contextPrompt = buildString {
+                            appendLine("You are helping a deaf person reply in a conversation.")
+                            appendLine("Recent conversation:")
+                            messages.takeLast(4).forEach { msg ->
+                                appendLine(if (msg.isFromOther) "Other: ${msg.text}" else "Me: ${msg.text}")
+                            }
+                            appendLine("\nSuggest exactly 3 short natural replies (max 8 words each).")
+                            appendLine("Format: one reply per line, no labels.")
+                        }
+                        val response = withContext(Dispatchers.IO) { RunAnywhere.chat(contextPrompt) }
+                        suggestions = response.trim().split("\n")
+                            .map { it.trim().removePrefix("-").trim() }
+                            .filter { it.isNotBlank() }
+                            .take(3)
+                    } catch (e: Exception) {
+                        suggestions = listOf("I understand", "Can you repeat?", "One moment")
+                    } finally {
+                        conversationState = ConversationState.IDLE
                     }
-                    appendLine("\nSuggest exactly 3 short natural replies (max 8 words each).")
-                    appendLine("Format: one reply per line, no numbering, no punctuation,NEVER include labels like 'Me:', 'Other:', 'Person:', 'Suggestion:','Myself:', '1.', 'A.', or 'Reply:'., NEVER include quotes around the text.")
-                }
-
-                // ✅ Use chat() not generate() — better for instruction following
-                val response = withContext(Dispatchers.IO) {
-                    RunAnywhere.chat(context)
-                }
-
-                // ✅ Clean parsing — split by newline, filter blanks
-                suggestions = response
-                    .trim()
-                    .split("\n")
-                    .map { line ->
-                        line
-                            .trim()
-                            .removePrefix("-")
-                            .removePrefix("•")
-                            .removePrefix("*")
-                            .trim()
-                            .trimEnd('.', ',', ';')
-                    }
-                    .filter { it.isNotBlank() && it.length > 2 }
-                    .take(3)
-
-            } catch (e: Exception) {
-                suggestions = listOf(
-                    "I understand",
-                    "Can you repeat that?",
-                    "One moment please"
-                )
-            } finally {
-                if (conversationState == ConversationState.GENERATING_SUGGESTIONS) {
+                } else {
                     conversationState = ConversationState.IDLE
                 }
             }
         }
     }
 
-    // ── Listen for other person ───────────────────────────────
     fun listenForOther() {
         conversationState = ConversationState.LISTENING
         errorMessage = null
         suggestions = emptyList()
+        streamingTranscript = ""
+
+        // Pause background mic classification to avoid hardware conflict
+        AudioForegroundService.stopMicCapture()
 
         listenJob = scope.launch(Dispatchers.IO) {
             val sampleRate = 16000
-            val bufferSize = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-
-            if (bufferSize <= 0) {
-                withContext(Dispatchers.Main) {
-                    errorMessage = "AudioRecord not available"
-                    conversationState = ConversationState.IDLE
-                }
-                return@launch
-            }
+            val bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
 
             try {
-                val record = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize * 4
-                )
-
+                val record = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize * 4)
                 if (record.state != AudioRecord.STATE_INITIALIZED) {
-                    withContext(Dispatchers.Main) {
+                    withContext(Dispatchers.Main) { 
                         errorMessage = "Microphone unavailable"
-                        conversationState = ConversationState.IDLE
+                        conversationState = ConversationState.IDLE 
                     }
+                    AudioForegroundService.startMicCapture()
                     return@launch
                 }
-
                 record.startRecording()
 
-                val out = ByteArrayOutputStream()
-                val buf = ByteArray(bufferSize)
-                // ✅ 5 seconds — more natural conversation length
-                val targetBytes = sampleRate * 2 * 5
+                var sttFallbackTriggered = false
 
-                while (out.size() < targetBytes && isActive &&
-                    conversationState == ConversationState.LISTENING
-                ) {
-                    val read = record.read(buf, 0, buf.size)
-                    if (read > 0) out.write(buf, 0, read)
-                }
+                if (ElevenLabsService.isEnabled(context)) {
+                    withContext(Dispatchers.Main) { Toast.makeText(context, "ElevenLabs Co-pilot Active", Toast.LENGTH_SHORT).show() }
+                    val webSocket = ElevenLabsService.createScribeWebSocket(
+                        onTranscriptResult = { transcript, isFinal ->
+                            scope.launch(Dispatchers.Main) {
+                                streamingTranscript = transcript
+                                if (isFinal && transcript.isNotBlank()) {
+                                    messages = messages + ConversationMessage(text = transcript, isFromOther = true)
+                                    streamingTranscript = ""
+                                    autoSaveHistory()
+                                    generateSuggestions()
+                                }
+                            }
+                        },
+                        onError = { error, isForbidden ->
+                            scope.launch(Dispatchers.Main) {
+                                errorMessage = if (isForbidden) "ElevenLabs Access Denied. Check Scribe permissions." else "Scribe Error: $error"
+                                sttFallbackTriggered = true
+                            }
+                        }
+                    )
 
-                record.stop()
-                record.release()
-
-                if (!isActive) return@launch
-
-                // ✅ Switch to transcribing state
-                withContext(Dispatchers.Main) {
-                    conversationState = ConversationState.TRANSCRIBING
-                }
-
-                val audioBytes = out.toByteArray()
-
-                // ✅ Skip if too short — likely no speech
-                if (audioBytes.size < sampleRate * 2) {
-                    withContext(Dispatchers.Main) {
-                        errorMessage = "Recording too short — try again"
-                        conversationState = ConversationState.IDLE
-                    }
-                    return@launch
-                }
-
-                val transcript = RunAnywhere.transcribe(audioBytes).trim()
-
-                withContext(Dispatchers.Main) {
-                    if (transcript.isNotBlank()) {
-                        messages = messages + ConversationMessage(
-                            text = transcript,
-                            isFromOther = true
-                        )
-                        conversationState = ConversationState.IDLE
-                        // ✅ Auto-generate suggestions after transcription
-                        generateSuggestions(transcript)
+                    if (webSocket == null) {
+                        sttFallbackTriggered = true
                     } else {
-                        errorMessage = "No speech detected — try again"
-                        conversationState = ConversationState.IDLE
+                        val buf = ByteArray(bufferSize)
+                        while (isActive && conversationState == ConversationState.LISTENING && !sttFallbackTriggered) {
+                            val read = record.read(buf, 0, buf.size)
+                            if (read > 0) {
+                                val chunk = buf.copyOfRange(0, read)
+                                val sent = ElevenLabsService.sendScribeAudio(webSocket, chunk)
+                                if (!sent) {
+                                    // Connection lost
+                                    sttFallbackTriggered = true
+                                }
+                            }
+                        }
+                        webSocket.close(1000, "User stopped")
+                    }
+                } else {
+                    sttFallbackTriggered = true
+                }
+
+                if (sttFallbackTriggered && isActive && conversationState == ConversationState.LISTENING) {
+                    withContext(Dispatchers.Main) { Toast.makeText(context, "Fallback: Whisper Offline", Toast.LENGTH_SHORT).show() }
+                    val out = ByteArrayOutputStream()
+                    val buf = ByteArray(bufferSize)
+                    val targetBytes = sampleRate * 2 * 6 
+
+                    while (out.size() < targetBytes && isActive && conversationState == ConversationState.LISTENING) {
+                        val read = record.read(buf, 0, buf.size)
+                        if (read > 0) out.write(buf, 0, read)
+                    }
+
+                    if (isActive && conversationState == ConversationState.LISTENING) {
+                        withContext(Dispatchers.Main) { conversationState = ConversationState.TRANSCRIBING }
+                        val audioBytes = out.toByteArray()
+                        if (audioBytes.size >= sampleRate * 2) {
+                            val transcript = RunAnywhere.transcribe(audioBytes).trim()
+                            withContext(Dispatchers.Main) {
+                                if (transcript.isNotBlank()) {
+                                    messages = messages + ConversationMessage(text = transcript, isFromOther = true)
+                                    autoSaveHistory()
+                                    generateSuggestions()
+                                } else {
+                                    errorMessage = "No speech detected"
+                                }
+                            }
+                        }
                     }
                 }
 
-            } catch (e: SecurityException) {
-                withContext(Dispatchers.Main) {
-                    errorMessage = "Microphone permission denied"
-                    conversationState = ConversationState.IDLE
-                }
+                try { record.stop() } catch (e: Exception) {}
+                record.release()
+                withContext(Dispatchers.Main) { conversationState = ConversationState.IDLE }
+
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    errorMessage = "Error: ${e.message}"
-                    conversationState = ConversationState.IDLE
-                }
+                withContext(Dispatchers.Main) { errorMessage = "Error: ${e.message}" ; conversationState = ConversationState.IDLE }
+            } finally {
+                // Resume background sound classification
+                AudioForegroundService.startMicCapture()
             }
         }
     }
 
-    // ── Speak reply via TTS ───────────────────────────────────
     fun speakMyReply(text: String = myReply) {
-        if (text.isBlank() || !ttsReady) return
-
+        if (text.isBlank()) return
         val replyText = text.trim()
-        messages = messages + ConversationMessage(
-            text = replyText,
-            isFromOther = false
-        )
+        messages = messages + ConversationMessage(text = replyText, isFromOther = false)
+        autoSaveHistory()
+        
         if (text == myReply) myReply = ""
         suggestions = emptyList()
 
         scope.launch {
             conversationState = ConversationState.SPEAKING
             try {
-                val output = withContext(Dispatchers.IO) {
-                    RunAnywhere.synthesize(replyText, TTSOptions())
-                }
-                withContext(Dispatchers.IO) {
+                var audioPlayed = false
+                if (ElevenLabsService.isEnabled(context)) {
+                    val audioBytes = ElevenLabsService.textToSpeech(replyText)
+                    if (audioBytes != null) {
+                        ElevenLabsService.playMp3Bytes(context, audioBytes)
+                        audioPlayed = true
+                    }
+                } 
+                if (!audioPlayed && ttsReady) {
+                    if (ElevenLabsService.isEnabled(context)) {
+                        withContext(Dispatchers.Main) { Toast.makeText(context, "TTS Fallback: Piper", Toast.LENGTH_SHORT).show() }
+                    }
+                    val output = withContext(Dispatchers.IO) { RunAnywhere.synthesize(replyText, TTSOptions()) }
                     playWavBytes(output.audioData)
                 }
             } catch (e: Exception) {
@@ -307,289 +315,133 @@ fun ConversationScreen(
         }
     }
 
-    // ── Save History Logic ────────────────────────────────────
-    fun saveToHistoryAndExit() {
-        if (messages.isNotEmpty()) {
-            val historyContent = messages.map { 
-                HistoryContentLine(it.text, fromOther = it.isFromOther, it.timestamp) 
-            }
-            historyViewModel.saveSession(HistoryType.CONVERSATION, historyContent)
-        }
-        onBack()
-    }
-
-    // ── Sidebar History Drawer ────────────────────────────────
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
-            ModalDrawerSheet(
-                modifier = Modifier.fillMaxWidth(0.85f),
-                drawerContainerColor = Color.White
-            ) {
+            ModalDrawerSheet(modifier = Modifier.fillMaxWidth(0.85f), drawerContainerColor = Color.White) {
                 HistoryDrawerContent(
                     historyViewModel = historyViewModel,
                     type = HistoryType.CONVERSATION,
                     onItemSelected = { item ->
-                        messages = item.content.map { 
-                            ConversationMessage(it.text, it.fromOther, it.timestamp) 
-                        }
+                        messages = item.content.map { ConversationMessage(it.text, it.fromOther, it.timestamp) }
+                        currentSessionId = item.id
                         scope.launch { drawerState.close() }
                     }
                 )
             }
         }
     ) {
-        // ── Main UI ───────────────────────────────────────────
         Scaffold(
             containerColor = Color(0xFFF8F9FA),
             topBar = {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Brush.linearGradient(listOf(softBlue, Color(0xFFA7C6FF))))
-                        .padding(top = 12.dp, bottom = 12.dp, start = 8.dp, end = 16.dp)
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(Icons.Default.Menu, contentDescription = "History", tint = Color.White)
-                        }
-                        IconButton(onClick = { saveToHistoryAndExit() }) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back",
-                                tint = Color.White
-                            )
-                        }
+                Box(modifier = Modifier.fillMaxWidth().background(Brush.linearGradient(listOf(softBlue, Color(0xFFA7C6FF)))).padding(top = 12.dp, bottom = 12.dp, start = 8.dp, end = 16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "History", tint = Color.White) }
+                        IconButton(onClick = { onBack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White) }
                         Spacer(Modifier.width(8.dp))
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                "Conversation",
-                                fontSize = 20.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
-                            if (conversationState != ConversationState.IDLE) {
-                                ConversationStateBadge(state = conversationState)
+                            Text("Conversation", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            if (conversationState != ConversationState.IDLE) ConversationStateBadge(state = conversationState)
+                        }
+                        IconButton(onClick = { 
+                            messages = emptyList()
+                            currentSessionId = UUID.randomUUID().toString()
+                            suggestions = emptyList()
+                            errorMessage = null
+                        }) { Icon(Icons.Default.Add, "New Chat", tint = Color.White) }
+                    }
+                }
+            }
+        ) { padding ->
+            Column(modifier = Modifier.fillMaxSize().padding(top = padding.calculateTopPadding()).background(Color(0xFFF8F9FA))) {
+                ModelStatusBar(sttReady, ttsReady, llmReady, elevenLabsEnabled)
+
+                errorMessage?.let { error ->
+                    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).clip(RoundedCornerShape(10.dp)).background(red.copy(alpha = 0.08f)).padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Warning, null, tint = red, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(error, fontSize = 12.sp, color = red, modifier = Modifier.weight(1f))
+                        IconButton(onClick = { errorMessage = null }, modifier = Modifier.size(20.dp)) { Icon(Icons.Default.Close, "Dismiss", tint = red, modifier = Modifier.size(14.dp)) }
+                    }
+                }
+
+                Box(modifier = Modifier.weight(1f)) {
+                    if (messages.isEmpty() && streamingTranscript.isEmpty()) {
+                        ConversationEmptyState()
+                    } else {
+                        LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            items(items = messages, key = { it.timestamp }) { msg -> ConversationBubble(message = msg) }
+                            if (streamingTranscript.isNotEmpty()) { item { StreamingBubble(text = streamingTranscript) } }
+                        }
+                    }
+                }
+
+                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        if (suggestions.isNotEmpty()) {
+                            LazyRow(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                items(items = suggestions) { suggestion ->
+                                    SuggestionChip(text = suggestion, onTap = { myReply = suggestion }, onSpeak = { speakMyReply(suggestion) }, purple = purple)
+                                }
                             }
                         }
-                        if (messages.isNotEmpty()) {
-                            IconButton(onClick = { 
-                                val historyContent = messages.map { HistoryContentLine(it.text, fromOther = it.isFromOther, it.timestamp) }
-                                historyViewModel.saveSession(HistoryType.CONVERSATION, historyContent)
-                                messages = emptyList() 
-                            }) {
-                                Icon(Icons.Default.Add, contentDescription = "New Chat", tint = Color.White)
+
+                        Button(
+                            onClick = {
+                                if (conversationState == ConversationState.LISTENING) { listenJob?.cancel() ; conversationState = ConversationState.IDLE }
+                                else if (hasPermission) listenForOther()
+                                else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            },
+                            modifier = Modifier.fillMaxWidth().height(50.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = if (conversationState == ConversationState.LISTENING) red else softBlue)
+                        ) {
+                            Icon(if (conversationState == ConversationState.LISTENING) Icons.Default.Stop else Icons.Default.Hearing, null)
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (conversationState == ConversationState.LISTENING) "Stop Co-pilot" else "Listen (Co-pilot)")
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = myReply, 
+                                onValueChange = { myReply = it }, 
+                                modifier = Modifier.weight(1f), 
+                                placeholder = { Text("Type your reply…", color = Color(0xFFB0B0B0)) }, 
+                                shape = RoundedCornerShape(12.dp),
+                                textStyle = TextStyle(color = Color.Black, fontSize = 16.sp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = purple, 
+                                    unfocusedBorderColor = Color(0xFFEEF0F5),
+                                    focusedTextColor = Color.Black,
+                                    unfocusedTextColor = Color.Black
+                                )
+                            )
+                            FloatingActionButton(onClick = { speakMyReply() }, modifier = Modifier.size(52.dp), containerColor = if (myReply.isBlank()) Color(0xFFEEF0F5) else purple, contentColor = if (myReply.isBlank()) Color(0xFFB0B0B0) else Color.White, elevation = FloatingActionButtonDefaults.elevation(0.dp)) {
+                                if (conversationState == ConversationState.SPEAKING) CircularProgressIndicator(modifier = Modifier.size(22.dp), color = Color.White, strokeWidth = 2.dp)
+                                else Icon(Icons.AutoMirrored.Filled.VolumeUp, "Speak")
                             }
                         }
                     }
                 }
             }
-        ) {padding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(
-                        top = padding.calculateTopPadding()
-                    )
-                    .background(Color(0xFFF8F9FA))
-            ) {
-                // ── Model status bar ──────────────────────────
-                if (!sttReady || !ttsReady) {
-                    ModelStatusBar(
-                        sttReady = sttReady,
-                        ttsReady = ttsReady,
-                        llmReady = llmReady
-                    )
-                }
+        }
+    }
+}
 
-                // ── Error message ─────────────────────────────
-                errorMessage?.let { error ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 6.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(red.copy(alpha = 0.08f))
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            Icons.Default.Warning,
-                            contentDescription = null,
-                            tint = red,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(error, fontSize = 12.sp, color = red, modifier = Modifier.weight(1f))
-                        IconButton(
-                            onClick = { errorMessage = null },
-                            modifier = Modifier.size(20.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.Close,
-                                contentDescription = "Dismiss",
-                                tint = red,
-                                modifier = Modifier.size(14.dp)
-                            )
-                        }
-                    }
-                }
-
-                // ── Messages ──────────────────────────────────
-                Box(modifier = Modifier.weight(1f)) {
-                    if (messages.isEmpty()) {
-                        ConversationEmptyState()
-                    } else {
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            items(
-                                items = messages,
-                                key = { it.timestamp }
-                            ) { msg ->
-                                ConversationBubble(message = msg)
-                            }
-                        }
-                    }
-
-                    // ── Generating indicator ───────────────────
-                    if (conversationState == ConversationState.GENERATING_SUGGESTIONS) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = 8.dp)
-                                .clip(RoundedCornerShape(50.dp))
-                                .background(purple.copy(alpha = 0.1f))
-                                .padding(horizontal = 14.dp, vertical = 6.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(12.dp),
-                                    color = purple,
-                                    strokeWidth = 2.dp
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    "Generating replies…",
-                                    fontSize = 12.sp,
-                                    color = purple
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // ── Bottom panel ──────────────────────────────
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-
-                        // ── Suggestions ───────────────────────
-                        if (suggestions.isNotEmpty()) {
-                            LazyRow(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(bottom = 12.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                items(items = suggestions) { suggestion: String ->
-                                    SuggestionChip(
-                                        text = suggestion,
-                                        onTap = { myReply = suggestion },
-                                        onSpeak = { speakMyReply(suggestion) },
-                                        purple = purple
-                                    )
-                                }
-                            }
-                        }
-
-                        // ── Listen button ─────────────────────
-                        Button(
-                            onClick = {
-                                if (conversationState == ConversationState.LISTENING) {
-                                    listenJob?.cancel()
-                                    conversationState = ConversationState.IDLE
-                                } else if (hasPermission) {
-                                    listenForOther()
-                                } else {
-                                    permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                }
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(50.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (conversationState == ConversationState.LISTENING) red else softBlue
-                            )
-                        ) {
-                            Icon(
-                                if (conversationState == ConversationState.LISTENING) Icons.Default.Stop else Icons.Default.Hearing,
-                                contentDescription = null
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                if (conversationState == ConversationState.LISTENING) "Stop Listening" else "Listen",
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-
-                        Spacer(Modifier.height(12.dp))
-
-                        // ── Reply input + speak ───────────────
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            OutlinedTextField(
-                                value = myReply,
-                                onValueChange = { myReply = it },
-                                modifier = Modifier.weight(1f),
-                                placeholder = {
-                                    Text(
-                                        "Type your reply…",
-                                        color = Color(0xFFB0B0B0)
-                                    )
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedTextColor = Color(0xFF1A2340),
-                                    unfocusedTextColor = Color(0xFF1A2340),
-                                    focusedBorderColor = purple,
-                                    unfocusedBorderColor = Color(0xFFEEF0F5)
-                                )
-                            )
-
-                            FloatingActionButton(
-                                onClick = { speakMyReply() },
-                                modifier = Modifier.size(52.dp),
-                                containerColor = if (myReply.isBlank()) Color(0xFFEEF0F5) else purple,
-                                contentColor = if (myReply.isBlank()) Color(0xFFB0B0B0) else Color.White,
-                                elevation = FloatingActionButtonDefaults.elevation(0.dp)
-                            ) {
-                                if (conversationState == ConversationState.SPEAKING) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(22.dp),
-                                        color = Color.White,
-                                        strokeWidth = 2.dp
-                                    )
-                                } else {
-                                    Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = "Speak")
-                                }
-                            }
-                        }
-                    }
+@Composable
+private fun StreamingBubble(text: String) {
+    val softBlue = Color(0xFF6FB1FC)
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+        Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(softBlue.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Person, null, tint = softBlue, modifier = Modifier.size(20.dp)) }
+        Spacer(Modifier.width(8.dp))
+        Column(horizontalAlignment = Alignment.Start, modifier = Modifier.widthIn(max = 280.dp)) {
+            Card(shape = RoundedCornerShape(topStart = 4.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 18.dp), colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.7f)), elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)) {
+                Row(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(text = text, fontSize = 15.sp, color = Color(0xFF1A2340).copy(alpha = 0.6f), lineHeight = 22.sp)
+                    Spacer(Modifier.width(8.dp))
+                    PulsingDot(color = softBlue)
                 }
             }
         }
@@ -599,218 +451,70 @@ fun ConversationScreen(
 @Composable
 private fun ConversationStateBadge(state: ConversationState) {
     val (label, color) = when (state) {
-        ConversationState.IDLE                  -> return
-        ConversationState.LISTENING             -> "Listening" to Color(0xFFFF6B6B)
-        ConversationState.TRANSCRIBING          -> "Transcribing" to Color(0xFFFFD166)
+        ConversationState.IDLE -> return
+        ConversationState.LISTENING -> "Listening" to Color(0xFFFF6B6B)
+        ConversationState.TRANSCRIBING -> "Transcribing" to Color(0xFFFFD166)
         ConversationState.GENERATING_SUGGESTIONS -> "Thinking" to Color(0xFF9C6FFC)
-        ConversationState.SPEAKING              -> "Speaking" to Color(0xFF6BCB77)
+        ConversationState.SPEAKING -> "Speaking" to Color(0xFF6BCB77)
     }
-
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50.dp))
-            .background(color.copy(alpha = 0.2f))
-            .padding(horizontal = 10.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            modifier = Modifier
-                .size(6.dp)
-                .clip(CircleShape)
-                .background(color)
-        )
+    Row(modifier = Modifier.clip(RoundedCornerShape(50.dp)).background(color.copy(alpha = 0.2f)).padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(color))
         Spacer(Modifier.width(5.dp))
-        Text(
-            label,
-            fontSize = 11.sp,
-            color = Color.White,
-            fontWeight = FontWeight.Medium
-        )
+        Text(label, fontSize = 11.sp, color = Color.White, fontWeight = FontWeight.Medium)
     }
 }
 
 @Composable
-private fun ModelStatusBar(
-    sttReady: Boolean,
-    ttsReady: Boolean,
-    llmReady: Boolean
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFFFFF8E1))
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            Icons.Default.Warning,
-            contentDescription = null,
-            tint = Color(0xFFFFD166),
-            modifier = Modifier.size(18.dp)
-        )
+private fun ModelStatusBar(sttReady: Boolean, ttsReady: Boolean, llmReady: Boolean, elevenLabsEnabled: Boolean) {
+    val showWarning = (!elevenLabsEnabled && (!sttReady || !ttsReady || !llmReady)) || (elevenLabsEnabled && (!llmReady && !ttsReady))
+    
+    val backgroundColor = if (elevenLabsEnabled) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
+    val iconColor = if (elevenLabsEnabled) Color(0xFF4CAF50) else Color(0xFFFFD166)
+
+    Row(modifier = Modifier.fillMaxWidth().background(backgroundColor).padding(horizontal = 16.dp, vertical = 10.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(if (elevenLabsEnabled) Icons.Default.CloudDone else Icons.Default.Warning, null, tint = iconColor, modifier = Modifier.size(18.dp))
         Column {
-            Text(
-                "Some models not loaded:",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF1A2340)
-            )
-            Text(
-                buildString {
-                    if (!sttReady) append("STT (listening) ")
-                    if (!ttsReady) append("TTS (speaking) ")
-                    if (!llmReady) append("LLM (suggestions) ")
-                    append("— download from Home")
-                },
-                fontSize = 11.sp,
-                color = Color(0xFF6B7A9A)
-            )
+            Text(if (elevenLabsEnabled) "AI Co-pilot: ElevenLabs Active" else "Offline Models Status:", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A2340))
+            Text(buildString {
+                if (elevenLabsEnabled) {
+                    append("Cloud Scribe STT, smart replies, and premium voice enabled")
+                } else {
+                    if (!sttReady) append("STT Down ")
+                    if (!ttsReady) append("TTS Down ")
+                    if (!llmReady) append("LLM Down ")
+                    if (sttReady && ttsReady && llmReady) append("All Offline Models Ready")
+                }
+            }, fontSize = 11.sp, color = Color(0xFF6B7A9A))
         }
     }
 }
 
 @Composable
 private fun ConversationEmptyState() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(32.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(80.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFF6FB1FC).copy(alpha = 0.1f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    Icons.Default.Forum,
-                    contentDescription = null,
-                    tint = Color(0xFF6FB1FC),
-                    modifier = Modifier.size(40.dp)
-                )
-            }
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(32.dp)) {
+            Box(modifier = Modifier.size(80.dp).clip(CircleShape).background(Color(0xFF6FB1FC).copy(alpha = 0.1f)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Forum, null, tint = Color(0xFF6FB1FC), modifier = Modifier.size(40.dp)) }
             Spacer(Modifier.height(20.dp))
-            Text(
-                "Start a conversation",
-                fontSize = 18.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF1A2340)
-            )
+            Text("Start a conversation", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A2340))
             Spacer(Modifier.height(8.dp))
-            Text(
-                "Tap Listen and let the other person speak.\nTheir words will appear here.\nType or tap a suggestion to reply.",
-                fontSize = 13.sp,
-                color = Color(0xFF6B7A9A),
-                textAlign = TextAlign.Center,
-                lineHeight = 20.sp
-            )
-            Spacer(Modifier.height(24.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-                StepHint(number = "1", label = "Listen")
-                StepHint(number = "2", label = "Read")
-                StepHint(number = "3", label = "Reply")
-            }
+            Text("Tap 'Listen (Co-pilot)' for ElevenLabs Realtime transcription and smart replies.", fontSize = 13.sp, color = Color(0xFF6B7A9A), textAlign = TextAlign.Center, lineHeight = 20.sp)
         }
     }
 }
 
 @Composable
-private fun StepHint(number: String, label: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(
-            modifier = Modifier
-                .size(36.dp)
-                .clip(CircleShape)
-                .background(Color(0xFF6FB1FC).copy(alpha = 0.15f)),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                number,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF6FB1FC)
-            )
-        }
-        Spacer(Modifier.height(4.dp))
-        Text(label, fontSize = 11.sp, color = Color(0xFF6B7A9A))
-    }
-}
-
-@Composable
-private fun SuggestionChip(
-    text: String,
-    onTap: () -> Unit,
-    onSpeak: () -> Unit,
-    purple: Color
-) {
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50.dp))
-            .background(purple.copy(alpha = 0.08f))
-            .border(
-                width = 1.dp,
-                color = purple.copy(alpha = 0.25f),
-                shape = RoundedCornerShape(50.dp)
-            )
-    ) {
-        // Tap to fill text field
-        TextButton(
-            onClick = onTap,
-            contentPadding = PaddingValues(
-                start = 14.dp,
-                end = 6.dp,
-                top = 6.dp,
-                bottom = 6.dp
-            )
-        ) {
-            Text(
-                text,
-                fontSize = 12.sp,
-                color = Color(0xFF1A2340),
-                maxLines = 1
-            )
-        }
-        // Tap speaker icon to speak directly
-        IconButton(
-            onClick = onSpeak,
-            modifier = Modifier
-                .size(32.dp)
-                .padding(end = 6.dp)
-        ) {
-            Icon(
-                Icons.Default.VolumeUp,
-                contentDescription = "Speak",
-                tint = purple,
-                modifier = Modifier.size(16.dp)
-            )
-        }
+private fun SuggestionChip(text: String, onTap: () -> Unit, onSpeak: () -> Unit, purple: Color) {
+    Row(modifier = Modifier.clip(RoundedCornerShape(50.dp)).background(purple.copy(alpha = 0.08f)).border(1.dp, purple.copy(alpha = 0.25f), RoundedCornerShape(50.dp))) {
+        TextButton(onClick = onTap, contentPadding = PaddingValues(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp)) { Text(text, fontSize = 12.sp, color = Color(0xFF1A2340), maxLines = 1) }
+        IconButton(onClick = onSpeak, modifier = Modifier.size(32.dp).padding(end = 6.dp)) { Icon(Icons.Default.VolumeUp, "Speak", tint = purple, modifier = Modifier.size(16.dp)) }
     }
 }
 
 @Composable
 private fun PulsingDot(color: Color) {
-    val infiniteTransition = rememberInfiniteTransition(label = "dot")
-    val scale by infiniteTransition.animateFloat(
-        initialValue = 0.8f,
-        targetValue = 1.2f,
-        animationSpec = infiniteRepeatable(
-            tween(500, easing = FastOutSlowInEasing),
-            RepeatMode.Reverse
-        ),
-        label = "dotScale"
-    )
-    Box(
-        modifier = Modifier
-            .size(10.dp)
-            .scale(scale)
-            .clip(CircleShape)
-            .background(color)
-    )
+    val infiniteTransition = rememberInfiniteTransition("dot")
+    val scale by infiniteTransition.animateFloat(0.8f, 1.2f, infiniteRepeatable(tween(500, easing = FastOutSlowInEasing), RepeatMode.Reverse), "dotScale")
+    Box(modifier = Modifier.size(10.dp).scale(scale).clip(CircleShape).background(color))
 }
 
 @Composable
@@ -820,80 +524,22 @@ private fun ConversationBubble(message: ConversationMessage) {
     val purple   = Color(0xFF9C6FFC)
     val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = if (isOther) Arrangement.Start else Arrangement.End
-    ) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = if (isOther) Arrangement.Start else Arrangement.End) {
         if (isOther) {
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(softBlue.copy(alpha = 0.12f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    Icons.Default.Person,
-                    contentDescription = null,
-                    tint = softBlue,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
+            Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(softBlue.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Person, null, tint = softBlue, modifier = Modifier.size(20.dp)) }
             Spacer(Modifier.width(8.dp))
         }
-
-        Column(
-            horizontalAlignment = if (isOther) Alignment.Start else Alignment.End,
-            modifier = Modifier.widthIn(max = 280.dp)
-        ) {
-            Card(
-                shape = RoundedCornerShape(
-                    topStart = if (isOther) 4.dp else 18.dp,
-                    topEnd = if (isOther) 18.dp else 4.dp,
-                    bottomStart = 18.dp,
-                    bottomEnd = 18.dp
-                ),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (isOther) Color.White else purple
-                ),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-            ) {
-                Text(
-                    text = message.text,
-                    fontSize = 15.sp,
-                    color = if (isOther) Color(0xFF1A2340) else Color.White,
-                    modifier = Modifier.padding(
-                        horizontal = 14.dp,
-                        vertical = 10.dp
-                    ),
-                    lineHeight = 22.sp
-                )
+        val bubbleAlignment: Alignment.Horizontal = if (isOther) Alignment.Start else Alignment.End
+        Column(horizontalAlignment = bubbleAlignment, modifier = Modifier.widthIn(max = 280.dp)) {
+            Card(shape = RoundedCornerShape(topStart = if (isOther) 4.dp else 18.dp, topEnd = if (isOther) 18.dp else 4.dp, bottomStart = 18.dp, bottomEnd = 18.dp), colors = CardDefaults.cardColors(containerColor = if (isOther) Color.White else purple), elevation = CardDefaults.cardElevation(2.dp)) {
+                Text(text = message.text, fontSize = 15.sp, color = if (isOther) Color(0xFF1A2340) else Color.White, modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp), lineHeight = 22.sp)
             }
             Spacer(Modifier.height(2.dp))
-            Text(
-                text = timeFormat.format(Date(message.timestamp)),
-                fontSize = 10.sp,
-                color = Color(0xFFB0B0B0),
-                modifier = Modifier.padding(horizontal = 4.dp)
-            )
+            Text(text = timeFormat.format(Date(message.timestamp)), fontSize = 10.sp, color = Color(0xFFB0B0B0), modifier = Modifier.padding(horizontal = 4.dp))
         }
-
         if (!isOther) {
             Spacer(Modifier.width(8.dp))
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(purple.copy(alpha = 0.12f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    Icons.Default.VolumeUp,
-                    contentDescription = null,
-                    tint = purple,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
+            Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(purple.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) { Icon(Icons.Default.VolumeUp, null, tint = purple, modifier = Modifier.size(20.dp)) }
         }
     }
 }

@@ -12,9 +12,7 @@ import androidx.compose.material.icons.automirrored.filled.HelpCenter
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -38,6 +36,8 @@ fun SettingsScreen(
     val notificationsEnabled by SettingsRepository.notificationsEnabled.collectAsState()
     val adaptiveMode by SettingsRepository.adaptiveMode.collectAsState()
     val flashEnabled by SettingsRepository.flashEnabled.collectAsState()
+    val useElevenLabs by SettingsRepository.useElevenLabs.collectAsState()
+    
     val context = LocalContext.current
 
     Column(
@@ -58,6 +58,19 @@ fun SettingsScreen(
                 fontSize = 28.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White
+            )
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        // ElevenLabs Preferences Section
+        SettingsSection(title = "AI Voice & Transcription") {
+            SettingsToggleItem(
+                icon = Icons.Default.CloudQueue,
+                label = "Use ElevenLabs Enhanced AI",
+                description = "Enable low-latency streaming STT & premium voices. Disabling falls back completely to offline on-device Whisper & Piper.",
+                checked = useElevenLabs,
+                onCheckedChange = { SettingsRepository.setUseElevenLabs(it) }
             )
         }
 
@@ -149,7 +162,7 @@ fun SettingsScreen(
         SettingsSection(title = "About") {
             SettingsInfoItem(label = "Version", value = "1.0.0 (Alpha)")
             HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), color = Color(0xFFF0F2F8))
-            SettingsInfoItem(label = "Engine", value = "RunAnywhere local AI")
+            SettingsInfoItem(label = "Engine", value = "RunAnywhere local AI + ElevenLabs")
         }
 
         Spacer(Modifier.height(32.dp))

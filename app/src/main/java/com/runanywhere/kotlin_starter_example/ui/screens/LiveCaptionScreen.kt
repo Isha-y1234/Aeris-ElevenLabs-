@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -27,12 +28,15 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.*
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.runanywhere.kotlin_starter_example.data.CaptionLine
 import com.runanywhere.kotlin_starter_example.data.HistoryContentLine
 import com.runanywhere.kotlin_starter_example.data.HistoryType
+import com.runanywhere.kotlin_starter_example.services.AudioForegroundService
+import com.runanywhere.kotlin_starter_example.services.ElevenLabsService
 import com.runanywhere.kotlin_starter_example.services.ModelService
 import com.runanywhere.kotlin_starter_example.viewmodel.ExportState
 import com.runanywhere.kotlin_starter_example.viewmodel.HistoryViewModel
@@ -43,7 +47,6 @@ import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
-import androidx.compose.foundation.layout.navigationBarsPadding
 
 @Composable
 fun LiveCaptionScreen(
@@ -61,8 +64,9 @@ fun LiveCaptionScreen(
     var captions by remember { mutableStateOf(listOf<CaptionLine>()) }
     var hasPermission by remember { mutableStateOf(false) }
     var captureJob by remember { mutableStateOf<Job?>(null) }
+    var streamingTranscript by remember { mutableStateOf("") }
+    var isUsingElevenLabs by remember { mutableStateOf(false) }
 
-    // ── PDF Export Observation ────────────────────────────────
     val exportState by mainViewModel.exportState.collectAsState(ExportState.Idle)
 
     LaunchedEffect(exportState) {
@@ -93,38 +97,108 @@ fun LiveCaptionScreen(
         ActivityResultContracts.RequestPermission()
     ) { hasPermission = it }
 
-    LaunchedEffect(captions.size) {
-        if (captions.isNotEmpty()) {
-            listState.animateScrollToItem(captions.size - 1)
+    LaunchedEffect(captions.size, streamingTranscript) {
+        if (captions.isNotEmpty() || streamingTranscript.isNotEmpty()) {
+            val targetIndex = if (streamingTranscript.isNotEmpty()) captions.size else captions.size - 1
+            if (targetIndex >= 0) {
+                listState.animateScrollToItem(targetIndex)
+            }
         }
     }
 
     fun startCaption() {
         isLive = true
+        streamingTranscript = ""
+        isUsingElevenLabs = ElevenLabsService.isEnabled(context)
+        
+        // Critical: Pause background sound classifier to release microphone
+        AudioForegroundService.stopMicCapture()
+
         captureJob = scope.launch(Dispatchers.IO) {
             val sampleRate = 16000
             val bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             try {
                 val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize * 4)
-                audioRecord.startRecording()
-                while (isActive && isLive) {
-                    val out = ByteArrayOutputStream()
-                    val buffer = ByteArray(bufferSize)
-                    val targetBytes = sampleRate * 2 * 3
-                    while (out.size() < targetBytes && isActive && isLive) {
-                        val read = audioRecord.read(buffer, 0, buffer.size)
-                        if (read > 0) out.write(buffer, 0, read)
+                if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+                    withContext(Dispatchers.Main) { 
+                        Toast.makeText(context, "Microphone access failed", Toast.LENGTH_SHORT).show()
+                        isLive = false 
                     }
-                    if (!isActive || !isLive) break
-                    val transcript = RunAnywhere.transcribe(out.toByteArray()).trim()
-                    if (transcript.isNotBlank()) {
-                        withContext(Dispatchers.Main) { captions = captions + CaptionLine(text = transcript) }
+                    AudioForegroundService.startMicCapture()
+                    return@launch
+                }
+                audioRecord.startRecording()
+
+                var sttFallbackTriggered = false
+
+                if (isUsingElevenLabs) {
+                    withContext(Dispatchers.Main) { Toast.makeText(context, "Cloud Scribe Active", Toast.LENGTH_SHORT).show() }
+                    val webSocket = ElevenLabsService.createScribeWebSocket(
+                        onTranscriptResult = { transcript, isFinal ->
+                            scope.launch(Dispatchers.Main) {
+                                streamingTranscript = transcript
+                                if (isFinal && transcript.isNotBlank()) {
+                                    captions = captions + CaptionLine(text = transcript)
+                                    streamingTranscript = ""
+                                }
+                            }
+                        },
+                        onError = { error, _ ->
+                            scope.launch(Dispatchers.Main) {
+                                Log.e("LiveCaption", "Scribe Error: $error")
+                                sttFallbackTriggered = true
+                                isUsingElevenLabs = false
+                            }
+                        }
+                    )
+
+                    if (webSocket != null) {
+                        val buf = ByteArray(bufferSize)
+                        while (isActive && isLive && !sttFallbackTriggered) {
+                            val read = audioRecord.read(buf, 0, buf.size)
+                            if (read > 0) {
+                                // FIXED: Using new JSON-based send method
+                                val chunk = buf.copyOfRange(0, read)
+                                val sent = ElevenLabsService.sendScribeAudio(webSocket, chunk)
+                                if (!sent) {
+                                    sttFallbackTriggered = true
+                                }
+                            }
+                        }
+                        webSocket.close(1000, "Session ended")
+                    } else {
+                        sttFallbackTriggered = true
+                    }
+                } else {
+                    sttFallbackTriggered = true
+                }
+
+                if (sttFallbackTriggered && isActive && isLive) {
+                    withContext(Dispatchers.Main) { Toast.makeText(context, "Fallback: Whisper Offline", Toast.LENGTH_SHORT).show() }
+                    while (isActive && isLive) {
+                        val out = ByteArrayOutputStream()
+                        val buffer = ByteArray(bufferSize)
+                        val targetBytes = sampleRate * 2 * 3
+                        while (out.size() < targetBytes && isActive && isLive) {
+                            val read = audioRecord.read(buffer, 0, buffer.size)
+                            if (read > 0) out.write(buffer, 0, read)
+                        }
+                        if (!isActive || !isLive) break
+                        val transcript = RunAnywhere.transcribe(out.toByteArray()).trim()
+                        if (transcript.isNotBlank()) {
+                            withContext(Dispatchers.Main) { captions = captions + CaptionLine(text = transcript) }
+                        }
                     }
                 }
-                audioRecord.stop()
+
+                try { audioRecord.stop() } catch (e: Exception) {}
                 audioRecord.release()
-            } catch (e: SecurityException) {
+            } catch (e: Exception) {
+                Log.e("LiveCaption", "Capture Error: ${e.message}")
                 withContext(Dispatchers.Main) { isLive = false }
+            } finally {
+                // Resume background monitoring when done
+                AudioForegroundService.startMicCapture()
             }
         }
     }
@@ -133,6 +207,8 @@ fun LiveCaptionScreen(
         isLive = false
         captureJob?.cancel()
         captureJob = null
+        streamingTranscript = ""
+        AudioForegroundService.startMicCapture()
     }
 
     fun saveToHistoryAndExit() {
@@ -146,10 +222,7 @@ fun LiveCaptionScreen(
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
-            ModalDrawerSheet(
-                modifier = Modifier.fillMaxWidth(0.85f),
-                drawerContainerColor = Color.White
-            ) {
+            ModalDrawerSheet(modifier = Modifier.fillMaxWidth(0.85f), drawerContainerColor = Color.White) {
                 HistoryDrawerContent(
                     historyViewModel = historyViewModel,
                     type = HistoryType.CAPTION,
@@ -162,99 +235,62 @@ fun LiveCaptionScreen(
         }
     ) {
         Scaffold(
-
             containerColor = Color.Transparent,
-
             topBar = {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Brush.linearGradient(listOf(Color(0xFF6FB1FC), Color(0xFFA7C6FF))))
-                        .padding(top = 12.dp, bottom = 12.dp, start = 8.dp, end = 8.dp)
-                ) {
+                Box(modifier = Modifier.fillMaxWidth().background(Brush.linearGradient(listOf(Color(0xFF6FB1FC), Color(0xFFA7C6FF)))).padding(top = 12.dp, bottom = 12.dp, start = 8.dp, end = 8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(Icons.Default.Menu, contentDescription = "History", tint = Color.White)
+                        IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, "History", tint = Color.White) }
+                        IconButton(onClick = { saveToHistoryAndExit() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Color.White) }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Live Captions", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                            if (isLive) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(if (isUsingElevenLabs) Color(0xFF6BCB77) else Color(0xFFFFD166)))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(if (isUsingElevenLabs) "ElevenLabs Cloud" else "Local Offline", fontSize = 10.sp, color = Color.White.copy(alpha = 0.8f))
+                                }
+                            }
                         }
-                        IconButton(onClick = { saveToHistoryAndExit() }) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.White)
-                        }
-                        Text("Live Captions", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White, modifier = Modifier.weight(1f))
-                        
-                        // SHARE BUTTON moved to top bar
-                        IconButton(
-                            onClick = { mainViewModel.exportCaptions(context, captions) },
-                            enabled = captions.isNotEmpty()
-                        ) {
-                            Icon(Icons.Default.Share, "Export", tint = Color.White)
-                        }
-
+                        IconButton(onClick = { mainViewModel.exportCaptions(context, captions) }, enabled = captions.isNotEmpty()) { Icon(Icons.Default.Share, "Export", tint = Color.White) }
                         if (captions.isNotEmpty()) {
                             IconButton(onClick = {
                                 val historyContent = captions.map { HistoryContentLine(it.text, fromOther = true, it.timestamp) }
                                 historyViewModel.saveSession(HistoryType.CAPTION, historyContent)
                                 captions = emptyList()
-                            }) {
-                                Icon(Icons.Default.Add, "New Session", tint = Color.White)
-                            }
-                        }
-
-                        if (isLive) {
-                            LiveBadge()
+                            }) { Icon(Icons.Default.Add, "New Session", tint = Color.White) }
                         }
                     }
                 }
             }
         ) { padding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-            .padding(
-                        top = padding.calculateTopPadding()
-                    )
-                    .background(Color(0xFFF8F9FA))
-            ) {
-                // Captions list
+            Column(modifier = Modifier.fillMaxSize().padding(top = padding.calculateTopPadding()).background(Color(0xFFF8F9FA))) {
                 Box(modifier = Modifier.weight(1f)) {
-                    if (captions.isEmpty()) {
+                    if (captions.isEmpty() && streamingTranscript.isEmpty()) {
                         EmptyCaptionsState()
                     } else {
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(items = captions, key = { it.timestamp }) { caption ->
-                                CaptionLineCard(caption = caption)
+                        LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(items = captions, key = { it.timestamp }) { msg -> CaptionLineCard(message = msg) }
+                            if (streamingTranscript.isNotEmpty()) {
+                                item {
+                                    Card(shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.7f)), elevation = CardDefaults.cardElevation(1.dp), modifier = Modifier.fillMaxWidth()) {
+                                        Text(streamingTranscript, fontSize = 16.sp, color = Color.Black.copy(alpha = 0.6f), modifier = Modifier.padding(14.dp), lineHeight = 24.sp)
+                                    }
+                                }
                             }
                         }
                     }
                 }
-
-                // Control bar
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(8.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(20.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(8.dp)) {
+                    Row(modifier = Modifier.padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
                         Button(
-                            onClick = { if (isLive) stopCaption() else startCaption() },
+                            onClick = { if (isLive) stopCaption() else if (hasPermission) startCaption() else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO) },
                             modifier = Modifier.fillMaxWidth().height(56.dp),
                             shape = RoundedCornerShape(16.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isLive) Color(0xFFFF6B6B) else Color(0xFF6FB1FC)
-                            ),
-                            enabled = modelService.isSTTLoaded && hasPermission
+                            colors = ButtonDefaults.buttonColors(containerColor = if (isLive) Color(0xFFFF6B6B) else Color(0xFF6FB1FC))
                         ) {
                             Icon(if (isLive) Icons.Default.Stop else Icons.Default.Mic, null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(if (isLive) "Stop Captions" else "Start Live Captions")
+                            Spacer(Modifier.width(12.dp))
+                            Text(if (isLive) "Stop Listening" else "Start Live Caption", fontSize = 16.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -264,40 +300,24 @@ fun LiveCaptionScreen(
 }
 
 @Composable
-private fun LiveBadge() {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.clip(RoundedCornerShape(50.dp)).background(Color.Red.copy(alpha = 0.2f)).padding(horizontal = 8.dp, vertical = 4.dp)
-    ) {
-        Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(Color.Red))
-        Spacer(Modifier.width(4.dp))
-        Text("LIVE", fontSize = 10.sp, color = Color.White, fontWeight = FontWeight.Bold)
+fun EmptyCaptionsState() {
+    Column(modifier = Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Box(modifier = Modifier.size(80.dp).clip(CircleShape).background(Color(0xFF6FB1FC).copy(alpha = 0.1f)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Mic, null, tint = Color(0xFF6FB1FC), modifier = Modifier.size(40.dp)) }
+        Spacer(Modifier.height(24.dp))
+        Text("No captions yet", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A2340))
+        Spacer(Modifier.height(8.dp))
+        Text("Tap the button below to start transcribing speech in real-time.", textAlign = TextAlign.Center, fontSize = 14.sp, color = Color(0xFF6B7A9A))
     }
 }
 
 @Composable
-private fun EmptyCaptionsState() {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(Icons.Default.ClosedCaption, null, modifier = Modifier.size(64.dp), tint = Color.LightGray)
-            Text("Captions will appear here", color = Color.Gray)
-        }
-    }
-}
-
-@Composable
-private fun CaptionLineCard(caption: CaptionLine) {
-    val timeFormat = SimpleDateFormat("h:mm:ss a", Locale.getDefault())
-    Card(
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
+fun CaptionLineCard(message: CaptionLine) {
+    val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)) {
         Column(modifier = Modifier.padding(14.dp)) {
-            Text(timeFormat.format(Date(caption.timestamp)), fontSize = 11.sp, color = Color.Gray)
+            Text(text = message.text, fontSize = 16.sp, color = Color(0xFF1A2340), lineHeight = 24.sp)
             Spacer(Modifier.height(4.dp))
-            Text(caption.text, fontSize = 16.sp, color = Color.Black, lineHeight = 24.sp)
+            Text(text = timeFormat.format(Date(message.timestamp)), fontSize = 10.sp, color = Color(0xFFB0B0B0), modifier = Modifier.align(Alignment.End))
         }
     }
 }

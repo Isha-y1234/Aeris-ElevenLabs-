@@ -83,26 +83,34 @@ class HistoryViewModel : ViewModel() {
         _searchQuery.value = query
     }
 
-    fun saveSession(type: HistoryType, content: List<HistoryContentLine>) {
+    /**
+     * Saves or updates a session. If sessionId is provided, it updates that document.
+     */
+    fun saveSession(type: HistoryType, content: List<HistoryContentLine>, sessionId: String? = null) {
         if (content.isEmpty()) return
         val uid = auth.currentUser?.uid ?: return
         
         viewModelScope.launch {
             try {
-                val id = UUID.randomUUID().toString()
+                val finalId = sessionId ?: UUID.randomUUID().toString()
                 
+                // Only generate title for new sessions or very short ones
                 val contextText = content.take(10).joinToString("\n") { it.text }
                 val prompt = "Generate a 2-4 word title for this conversation snippet. Respond with ONLY the title.\nSnippet: $contextText"
                 
-                var title = try {
-                    withContext(Dispatchers.IO) {
-                        RunAnywhere.chat(prompt).trim().removeSurrounding("\"").removeSurrounding("'")
+                var title = if (content.size <= 5 || sessionId == null) {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            RunAnywhere.chat(prompt).trim().removeSurrounding("\"").removeSurrounding("'")
+                        }
+                    } catch (e: Exception) {
+                        if (type == HistoryType.CONVERSATION) "Conversation" else "Live Captions"
                     }
-                } catch (e: Exception) {
-                    if (type == HistoryType.CONVERSATION) "Conversation" else "Live Captions"
+                } else {
+                    null // Don't change title for updates unless it's new
                 }
                 
-                if (title.isBlank() || title.length > 50) {
+                if (title != null && (title.isBlank() || title.length > 50)) {
                     title = if (type == HistoryType.CONVERSATION) "Conversation" else "Live Captions"
                 }
 
@@ -110,20 +118,27 @@ class HistoryViewModel : ViewModel() {
                     it.copy(text = EncryptionManager.encrypt(it.text, uid)) 
                 }
 
-                val item = SyncedHistoryItem(
-                    id = id,
-                    type = type,
-                    title = title,
-                    timestamp = System.currentTimeMillis(),
-                    content = encryptedContent
-                )
-                
-                db.collection("users")
+                val docRef = db.collection("users")
                     .document(uid)
                     .collection("history")
-                    .document(item.id)
-                    .set(item)
-                    .await()
+                    .document(finalId)
+
+                if (sessionId == null || title != null) {
+                    val item = SyncedHistoryItem(
+                        id = finalId,
+                        type = type,
+                        title = title ?: "Conversation",
+                        timestamp = System.currentTimeMillis(),
+                        content = encryptedContent
+                    )
+                    docRef.set(item).await()
+                } else {
+                    // Update only content and timestamp
+                    docRef.update(
+                        "content", encryptedContent,
+                        "timestamp", System.currentTimeMillis()
+                    ).await()
+                }
                 
             } catch (e: Exception) {
                 Log.e("HistoryViewModel", "Error saving session", e)

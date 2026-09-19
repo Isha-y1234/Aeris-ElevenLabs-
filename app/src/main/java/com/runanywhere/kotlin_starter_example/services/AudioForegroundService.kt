@@ -21,20 +21,31 @@ class AudioForegroundService : Service() {
         const val TAG = "AudioForegroundService"
         var isRunning = false
             private set
+        
+        // Static hook to allow Screens to pause classification when using ElevenLabs
+        private var instance: AudioForegroundService? = null
+        
+        fun stopMicCapture() {
+            instance?.stopListening()
+        }
+        
+        fun startMicCapture() {
+            instance?.startListening()
+        }
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
-    private lateinit var audioProcessor: AudioProcessor
+    private var audioProcessor: AudioProcessor? = null
     private lateinit var classifier: SoundClassifier
     
     private val lastNotificationTimes = mutableMapOf<SoundType, Long>()
     private val NOTIFICATION_COOLDOWN = 8000L
+    private var listeningJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "Service onCreate")
+        instance = this
         isRunning = true
-        audioProcessor = AudioProcessor(applicationContext)
         classifier = SoundClassifier(applicationContext)
         createNotificationChannels()
         
@@ -49,47 +60,52 @@ class AudioForegroundService : Service() {
     }
 
     private fun startListening() {
-        scope.launch {
+        if (listeningJob?.isActive == true) return
+        
+        audioProcessor = AudioProcessor(applicationContext)
+        listeningJob = scope.launch {
             try {
-                audioProcessor.start { audioChunk ->
+                audioProcessor?.start { audioChunk ->
                     scope.launch {
                         try {
                             val predictions = classifier.classify(audioChunk)
                             if (predictions.isNotEmpty()) {
                                 val sensitivities = SettingsRepository.sensitivities.value
                                 val filtered = predictions.filter { (type, conf) ->
+                                    // FIXED: Safe lookup to prevent floatValue() crash on null
                                     val threshold = sensitivities[type] ?: 0.5f
                                     conf >= threshold
                                 }
 
                                 if (filtered.isNotEmpty()) {
                                     SoundRepository.updateDetection(filtered)
-                                    
                                     val top = filtered.maxByOrNull { it.value }!!
-                                    
-                                    // Trigger haptics
                                     HapticManager.trigger(applicationContext, top.key)
                                     
-                                    // Trigger Visual Flash (Removed for VOICE as requested)
                                     if (SettingsRepository.flashEnabled.value && 
                                         Settings.canDrawOverlays(applicationContext) &&
                                         top.key != SoundType.VOICE) {
                                         triggerFlashAlert(top.key)
                                     }
-                                    
-                                    // Notification
                                     checkAndSendNotification(filtered)
                                 }
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "Detection error: ${e.message}")
+                            Log.e(TAG, "Classification Error: ${e.message}")
                         }
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "startListening error: ${e.message}")
+                Log.e(TAG, "Mic Capture Error: ${e.message}")
             }
         }
+    }
+
+    private fun stopListening() {
+        listeningJob?.cancel()
+        audioProcessor?.stop()
+        audioProcessor = null
+        Log.d(TAG, "Background mic capture paused for high-priority session")
     }
 
     private fun triggerFlashAlert(type: SoundType) {
@@ -98,7 +114,7 @@ class AudioForegroundService : Service() {
             SoundType.SIREN -> Color.RED
             SoundType.HORN -> Color.YELLOW
             SoundType.DOORBELL -> Color.BLUE
-            SoundType.VOICE -> Color.TRANSPARENT // Should not be reached due to filter
+            else -> Color.TRANSPARENT
         }
         if (color != Color.TRANSPARENT) {
             FlashAlertService.start(applicationContext, color)
@@ -117,15 +133,8 @@ class AudioForegroundService : Service() {
     }
 
     private fun sendSoundNotification(type: SoundType, confidence: Float) {
-        // Check for Android 13+ permission
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (androidx.core.content.ContextCompat.checkSelfPermission(
-                    this, android.Manifest.permission.POST_NOTIFICATIONS
-                ) != android.content.pm.PackageManager.PERMISSION_GRANTED
-            ) {
-                Log.e(TAG, "Notification permission not granted")
-                return
-            }
+            if (androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
         }
         val manager = getSystemService(NotificationManager::class.java)
         val notification = NotificationCompat.Builder(this, "aeris_alerts")
@@ -143,8 +152,9 @@ class AudioForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        instance = null
         scope.cancel()
-        audioProcessor.stop()
+        audioProcessor?.stop()
         classifier.close()
         SoundRepository.updateDetection(emptyMap())
     }

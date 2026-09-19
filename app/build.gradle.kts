@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.google.gms.google-services")
     alias(libs.plugins.android.application)
@@ -5,10 +7,18 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
-
 android {
     namespace = "com.runanywhere.kotlin_starter_example"
     compileSdk = 35
+
+    val localProperties = Properties()
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use {
+            localProperties.load(it)
+        }
+    }
+    val apiKey = localProperties.getProperty("elevenlabs.api.key") ?: "placeholder"
 
     defaultConfig {
         applicationId = "com.runanywhere.kotlin_starter_example"
@@ -22,6 +32,8 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        buildConfigField("String", "ELEVENLABS_API_KEY", "\"$apiKey\"")
     }
 
     buildTypes {
@@ -45,20 +57,17 @@ android {
     
     buildFeatures {
         compose = true
+        buildConfig = true
     }
-
 
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
-            // Exclude desktop-specific libraries that fail 16KB alignment checks
             excludes += "debian-amd64/**"
             excludes += "**/libwhisper.so*"
         }
         jniLibs {
-            // Forces compression/extraction which avoids alignment issues with pre-built libs
             useLegacyPackaging = true
-
             pickFirsts += listOf(
                 "lib/arm64-v8a/libonnxruntime.so",
                 "lib/armeabi-v7a/libonnxruntime.so",
@@ -79,14 +88,17 @@ dependencies {
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
     
-    // Jetpack Compose
-    implementation(libs.androidx.activity.compose)
+    // Jetpack Compose - Catalog usage
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.foundation)
+    implementation("androidx.compose.foundation:foundation-layout")
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.material.icons.extended)
+    
+    implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.navigation.compose)
     debugImplementation(libs.androidx.compose.ui.tooling)
@@ -105,9 +117,8 @@ dependencies {
     implementation(libs.tensorflow.lite.support)
     implementation(libs.tensorflow.lite.gpu)
 
-    //firebase
+    // Firebase
     implementation(platform("com.google.firebase:firebase-bom:33.8.0"))
-
     implementation("com.google.firebase:firebase-auth-ktx")
     implementation("com.google.firebase:firebase-firestore-ktx")
 
@@ -115,6 +126,9 @@ dependencies {
     implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
     implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
     
+    // OkHttp for ElevenLabs integrations
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     // Testing
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
