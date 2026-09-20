@@ -5,6 +5,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -15,6 +16,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.*
+import com.runanywhere.kotlin_starter_example.services.AudioForegroundService
 import com.runanywhere.kotlin_starter_example.services.ElevenLabsService
 import com.runanywhere.kotlin_starter_example.services.ModelService
 import com.runanywhere.kotlin_starter_example.services.playWavBytes
@@ -22,6 +24,12 @@ import com.runanywhere.sdk.public.RunAnywhere
 import com.runanywhere.sdk.public.extensions.TTS.TTSOptions
 import com.runanywhere.sdk.public.extensions.synthesize
 import kotlinx.coroutines.*
+
+enum class VoiceProxyState {
+    IDLE,
+    GENERATING,
+    SPEAKING
+}
 
 @Composable
 fun VoiceProxyScreen(
@@ -31,7 +39,7 @@ fun VoiceProxyScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var inputText by remember { mutableStateOf("") }
-    var isSpeaking by remember { mutableStateOf(false) }
+    var proxyState by remember { mutableStateOf(VoiceProxyState.IDLE) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
     val recentPhrases = remember {
@@ -48,16 +56,21 @@ fun VoiceProxyScreen(
 
     suspend fun speak(text: String) {
         if (text.isBlank()) return
-        isSpeaking = true
         errorMessage = null
+        
+        // release background mic to avoid hardware overlap during playback
+        AudioForegroundService.stopMicCapture()
         
         try {
             var audioPlayed = false
             
             // 1. Primary: ElevenLabs TTS
             if (ElevenLabsService.isEnabled(context)) {
-                val audioBytes = ElevenLabsService.textToSpeech(text)
+                proxyState = VoiceProxyState.GENERATING
+                // Fix: Pass context to ElevenLabsService.textToSpeech
+                val audioBytes = ElevenLabsService.textToSpeech(context, text)
                 if (audioBytes != null) {
+                    proxyState = VoiceProxyState.SPEAKING
                     ElevenLabsService.playMp3Bytes(context, audioBytes)
                     audioPlayed = true
                 }
@@ -65,24 +78,22 @@ fun VoiceProxyScreen(
             
             // 2. Fallback: Piper Offline
             if (!audioPlayed && modelService.isTTSLoaded) {
+                proxyState = VoiceProxyState.SPEAKING
                 if (ElevenLabsService.isEnabled(context)) {
                     withContext(Dispatchers.Main) { 
-                        Toast.makeText(context, "ElevenLabs TTS failed, using Piper", Toast.LENGTH_SHORT).show() 
+                        Toast.makeText(context, "Cloud TTS unavailable, using offline voice", Toast.LENGTH_SHORT).show() 
                     }
                 }
                 val output = withContext(Dispatchers.IO) {
                     RunAnywhere.synthesize(text, TTSOptions())
                 }
-                withContext(Dispatchers.IO) {
-                    playWavBytes(output.audioData)
-                }
+                playWavBytes(output.audioData)
                 audioPlayed = true
             }
             
             if (!audioPlayed) {
-                errorMessage = "No voice models available"
+                errorMessage = "Voice models unavailable. Check internet or model settings."
             } else {
-                // Add to recent if not already there
                 if (!recentPhrases.contains(text)) {
                     recentPhrases.add(0, text)
                     if (recentPhrases.size > 6) recentPhrases.removeLastOrNull()
@@ -91,7 +102,9 @@ fun VoiceProxyScreen(
         } catch (e: Exception) {
             errorMessage = "TTS failed: ${e.message}"
         } finally {
-            isSpeaking = false
+            proxyState = VoiceProxyState.IDLE
+            // Resume background monitoring
+            AudioForegroundService.startMicCapture()
         }
     }
 
@@ -124,9 +137,9 @@ fun VoiceProxyScreen(
 
         // Status Card
         if (ElevenLabsService.isEnabled(context)) {
-            StatusCard(label = "ElevenLabs TTS Active", color = Color(0xFF6BCB77), icon = Icons.Default.CloudDone)
+            StatusCard(label = "ElevenLabs Cloud Active", color = Color(0xFF6BCB77), icon = Icons.Default.CloudDone)
         } else {
-            StatusCard(label = "Piper Offline TTS Active", color = Color(0xFFFFD166), icon = Icons.Default.CloudOff)
+            StatusCard(label = "Offline Model Active", color = Color(0xFFFFD166), icon = Icons.Default.CloudOff)
         }
 
         Spacer(Modifier.height(16.dp))
@@ -163,14 +176,14 @@ fun VoiceProxyScreen(
                     modifier = Modifier.fillMaxWidth().height(52.dp),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = softBlue),
-                    enabled = !isSpeaking && inputText.isNotBlank()
+                    enabled = proxyState == VoiceProxyState.IDLE && inputText.isNotBlank()
                 ) {
-                    if (isSpeaking) {
+                    if (proxyState != VoiceProxyState.IDLE) {
                         CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
                         Spacer(Modifier.width(8.dp))
-                        Text("Speaking…", fontWeight = FontWeight.SemiBold)
+                        Text(if (proxyState == VoiceProxyState.GENERATING) "Generating…" else "Speaking…", fontWeight = FontWeight.SemiBold)
                     } else {
-                        Icon(Icons.Default.VolumeUp, contentDescription = null)
+                        Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Speak Aloud", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                     }
@@ -187,14 +200,14 @@ fun VoiceProxyScreen(
         recentPhrases.forEach { phrase ->
             Card(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp).clickable {
-                    if (!isSpeaking) { scope.launch { speak(phrase) } }
+                    if (proxyState == VoiceProxyState.IDLE) { scope.launch { speak(phrase) } }
                 },
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
                 elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
             ) {
                 Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.VolumeUp, null, tint = softBlue, modifier = Modifier.size(20.dp))
+                    Icon(Icons.AutoMirrored.Filled.VolumeUp, null, tint = softBlue, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(12.dp))
                     Text(phrase, fontSize = 14.sp, color = Color(0xFF1A2340), modifier = Modifier.weight(1f))
                     Icon(Icons.Default.PlayArrow, null, tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))

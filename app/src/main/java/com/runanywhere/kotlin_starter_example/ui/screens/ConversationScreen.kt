@@ -66,6 +66,7 @@ enum class ConversationState {
     LISTENING,
     TRANSCRIBING,
     GENERATING_SUGGESTIONS,
+    GENERATING_SPEECH,
     SPEAKING
 }
 
@@ -196,7 +197,7 @@ fun ConversationScreen(
                 var sttFallbackTriggered = false
 
                 if (ElevenLabsService.isEnabled(context)) {
-                    withContext(Dispatchers.Main) { Toast.makeText(context, "ElevenLabs Co-pilot Active", Toast.LENGTH_SHORT).show() }
+                    withContext(Dispatchers.Main) { Toast.makeText(context, "Co-pilot (ElevenLabs) Active", Toast.LENGTH_SHORT).show() }
                     val webSocket = ElevenLabsService.createScribeWebSocket(
                         onTranscriptResult = { transcript, isFinal ->
                             scope.launch(Dispatchers.Main) {
@@ -211,7 +212,7 @@ fun ConversationScreen(
                         },
                         onError = { error, isForbidden ->
                             scope.launch(Dispatchers.Main) {
-                                errorMessage = if (isForbidden) "ElevenLabs Access Denied. Check Scribe permissions." else "Scribe Error: $error"
+                                errorMessage = if (isForbidden) "ElevenLabs Access Denied. Check Scribe permissions." else "STT Error: $error"
                                 sttFallbackTriggered = true
                             }
                         }
@@ -224,12 +225,9 @@ fun ConversationScreen(
                         while (isActive && conversationState == ConversationState.LISTENING && !sttFallbackTriggered) {
                             val read = record.read(buf, 0, buf.size)
                             if (read > 0) {
+                                // Protocol Fix: Scribe v2 requires JSON framing + Base64
                                 val chunk = buf.copyOfRange(0, read)
-                                val sent = ElevenLabsService.sendScribeAudio(webSocket, chunk)
-                                if (!sent) {
-                                    // Connection lost
-                                    sttFallbackTriggered = true
-                                }
+                                ElevenLabsService.sendScribeAudio(webSocket, chunk)
                             }
                         }
                         webSocket.close(1000, "User stopped")
@@ -283,29 +281,44 @@ fun ConversationScreen(
     fun speakMyReply(text: String = myReply) {
         if (text.isBlank()) return
         val replyText = text.trim()
-        messages = messages + ConversationMessage(text = replyText, isFromOther = false)
-        autoSaveHistory()
+        
+        // Add to message history only if it's not already the last message
+        if (messages.lastOrNull()?.text != replyText || messages.lastOrNull()?.isFromOther == true) {
+            messages = messages + ConversationMessage(text = replyText, isFromOther = false)
+            autoSaveHistory()
+        }
         
         if (text == myReply) myReply = ""
         suggestions = emptyList()
 
         scope.launch {
-            conversationState = ConversationState.SPEAKING
             try {
                 var audioPlayed = false
                 if (ElevenLabsService.isEnabled(context)) {
-                    val audioBytes = ElevenLabsService.textToSpeech(replyText)
+                    conversationState = ConversationState.GENERATING_SPEECH
+
+                    // Fix: Pass context to ElevenLabsService.textToSpeech
+                    val audioBytes = ElevenLabsService.textToSpeech(context, replyText)
                     if (audioBytes != null) {
+                        conversationState = ConversationState.SPEAKING
+                        // Standardized function name call
                         ElevenLabsService.playMp3Bytes(context, audioBytes)
                         audioPlayed = true
                     }
                 } 
+                
                 if (!audioPlayed && ttsReady) {
+                    conversationState = ConversationState.SPEAKING
                     if (ElevenLabsService.isEnabled(context)) {
                         withContext(Dispatchers.Main) { Toast.makeText(context, "TTS Fallback: Piper", Toast.LENGTH_SHORT).show() }
                     }
                     val output = withContext(Dispatchers.IO) { RunAnywhere.synthesize(replyText, TTSOptions()) }
                     playWavBytes(output.audioData)
+                    audioPlayed = true
+                }
+                
+                if (!audioPlayed) {
+                    errorMessage = "Text-to-Speech unavailable"
                 }
             } catch (e: Exception) {
                 errorMessage = "TTS failed: ${e.message}"
@@ -419,7 +432,7 @@ fun ConversationScreen(
                                 )
                             )
                             FloatingActionButton(onClick = { speakMyReply() }, modifier = Modifier.size(52.dp), containerColor = if (myReply.isBlank()) Color(0xFFEEF0F5) else purple, contentColor = if (myReply.isBlank()) Color(0xFFB0B0B0) else Color.White, elevation = FloatingActionButtonDefaults.elevation(0.dp)) {
-                                if (conversationState == ConversationState.SPEAKING) CircularProgressIndicator(modifier = Modifier.size(22.dp), color = Color.White, strokeWidth = 2.dp)
+                                if (conversationState == ConversationState.SPEAKING || conversationState == ConversationState.GENERATING_SPEECH) CircularProgressIndicator(modifier = Modifier.size(22.dp), color = Color.White, strokeWidth = 2.dp)
                                 else Icon(Icons.AutoMirrored.Filled.VolumeUp, "Speak")
                             }
                         }
@@ -455,6 +468,7 @@ private fun ConversationStateBadge(state: ConversationState) {
         ConversationState.LISTENING -> "Listening" to Color(0xFFFF6B6B)
         ConversationState.TRANSCRIBING -> "Transcribing" to Color(0xFFFFD166)
         ConversationState.GENERATING_SUGGESTIONS -> "Thinking" to Color(0xFF9C6FFC)
+        ConversationState.GENERATING_SPEECH -> "Loading Audio" to Color(0xFF6FB1FC)
         ConversationState.SPEAKING -> "Speaking" to Color(0xFF6BCB77)
     }
     Row(modifier = Modifier.clip(RoundedCornerShape(50.dp)).background(color.copy(alpha = 0.2f)).padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -466,8 +480,6 @@ private fun ConversationStateBadge(state: ConversationState) {
 
 @Composable
 private fun ModelStatusBar(sttReady: Boolean, ttsReady: Boolean, llmReady: Boolean, elevenLabsEnabled: Boolean) {
-    val showWarning = (!elevenLabsEnabled && (!sttReady || !ttsReady || !llmReady)) || (elevenLabsEnabled && (!llmReady && !ttsReady))
-    
     val backgroundColor = if (elevenLabsEnabled) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
     val iconColor = if (elevenLabsEnabled) Color(0xFF4CAF50) else Color(0xFFFFD166)
 
@@ -506,7 +518,7 @@ private fun ConversationEmptyState() {
 private fun SuggestionChip(text: String, onTap: () -> Unit, onSpeak: () -> Unit, purple: Color) {
     Row(modifier = Modifier.clip(RoundedCornerShape(50.dp)).background(purple.copy(alpha = 0.08f)).border(1.dp, purple.copy(alpha = 0.25f), RoundedCornerShape(50.dp))) {
         TextButton(onClick = onTap, contentPadding = PaddingValues(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp)) { Text(text, fontSize = 12.sp, color = Color(0xFF1A2340), maxLines = 1) }
-        IconButton(onClick = onSpeak, modifier = Modifier.size(32.dp).padding(end = 6.dp)) { Icon(Icons.Default.VolumeUp, "Speak", tint = purple, modifier = Modifier.size(16.dp)) }
+        IconButton(onClick = onSpeak, modifier = Modifier.size(32.dp).padding(end = 6.dp)) { Icon(Icons.AutoMirrored.Filled.VolumeUp, "Speak", tint = purple, modifier = Modifier.size(16.dp)) }
     }
 }
 
@@ -539,7 +551,7 @@ private fun ConversationBubble(message: ConversationMessage) {
         }
         if (!isOther) {
             Spacer(Modifier.width(8.dp))
-            Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(purple.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) { Icon(Icons.Default.VolumeUp, null, tint = purple, modifier = Modifier.size(20.dp)) }
+            Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(purple.copy(alpha = 0.12f)), contentAlignment = Alignment.Center) { Icon(Icons.AutoMirrored.Filled.VolumeUp, null, tint = purple, modifier = Modifier.size(20.dp)) }
         }
     }
 }
